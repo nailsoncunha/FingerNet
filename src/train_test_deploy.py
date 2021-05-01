@@ -1,27 +1,31 @@
 #coding=utf-8
 import os, sys, cv2, pickle
 from multiprocessing import Pool
-from functools import partial
+from functools import partial, reduce
 from time import time
 import matplotlib
 # Force matplotlib to not use any Xwindows backend.
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+from skimage.io import imread, imsave
+
 from datetime import datetime
 from utils import *
 from scipy import misc, ndimage, signal, sparse, io
 
-from keras import backend as K
-from keras.models import Model
-from keras.layers import Input
-from keras.layers.core import Flatten,Activation,Lambda
-from keras.layers.convolutional import Conv2D,MaxPooling2D,UpSampling2D
-from keras.layers.normalization import BatchNormalization
-from keras.layers.advanced_activations import PReLU
-from keras.regularizers import l2
-from keras.optimizers import SGD, Adam
-from keras.utils import plot_model
-from keras.callbacks import ModelCheckpoint  
+from tensorflow.keras import backend as K
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input
+from tensorflow.keras.layers import Flatten,Activation,Lambda
+from tensorflow.keras.layers import Conv2D,MaxPooling2D,UpSampling2D
+from tensorflow.keras.layers import BatchNormalization
+from tensorflow.keras.layers import PReLU
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.optimizers import SGD, Adam
+from tensorflow.keras.utils import plot_model
+from tensorflow.keras.callbacks import ModelCheckpoint
+
+import tensorflow as tf  
 
 import argparse
 parser = argparse.ArgumentParser(description='Train-Test-Deploy')
@@ -32,9 +36,9 @@ parser.add_argument('mode', type=str, default="train",
 args = parser.parse_args()
 
 os.environ["CUDA_VISIBLE_DEVICES"]=args.GPU
-config = K.tf.ConfigProto(gpu_options=K.tf.GPUOptions(allow_growth=True))
-sess = K.tf.Session(config=config)
-K.set_session(sess)
+config = tf.compat.v1.ConfigProto(gpu_options=tf.compat.v1.GPUOptions(allow_growth=True))
+sess = tf.compat.v1.Session(config=config)
+tf.compat.v1.keras.backend.set_session(sess)
 
 batch_size = 2
 use_multiprocessing = False
@@ -42,8 +46,9 @@ use_multiprocessing = False
 train_set = ['../datasets/CISL24218/',]
 train_sample_rate = None
 test_set = ['../datasets/NISTSD27/',]
-deploy_set = ['../datasets/NISTSD27/images/','../datasets/CISL24218/', \
-            '../datasets/FVC2002DB2A/','../datasets/NIST4/','../datasets/NIST14/']
+# deploy_set = ['../datasets/NISTSD27/images/','../datasets/CISL24218/', \
+            # '../datasets/FVC2002DB2A/','../datasets/NIST4/','../datasets/NIST14/']
+deploy_set = ['../datasets/Model17k/',]
 pretrain = '../models/released_version/Model.model'
 output_dir = '../output/'+datetime.now().strftime('%Y%m%d-%H%M%S')
 logging = init_log(output_dir)
@@ -53,46 +58,46 @@ copy_file(sys.path[0]+'/'+sys.argv[0], output_dir+'/')
 def img_normalization(img_input, m0=0.0, var0=1.0):
     m = K.mean(img_input, axis=[1,2,3], keepdims=True)
     var = K.var(img_input, axis=[1,2,3], keepdims=True)
-    after = K.sqrt(var0*K.tf.square(img_input-m)/var)
-    image_n = K.tf.where(K.tf.greater(img_input, m), m0+after, m0-after)
+    after = K.sqrt(var0*K.square(img_input-m)/var)
+    image_n = tf.where(K.greater(img_input, m), m0+after, m0-after)
     return image_n
 
 # atan2 function
 def atan2(y_x):
     y, x = y_x[0], y_x[1]+K.epsilon()
-    atan = K.tf.atan(y/x)
-    angle = K.tf.where(K.tf.greater(x,0.0), atan, K.tf.zeros_like(x))
-    angle = K.tf.where(K.tf.logical_and(K.tf.less(x,0.0),  K.tf.greater_equal(y,0.0)), atan+np.pi, angle)
-    angle = K.tf.where(K.tf.logical_and(K.tf.less(x,0.0),  K.tf.less(y,0.0)), atan-np.pi, angle)
+    atan = tf.atan(y/x)
+    angle = tf.where(tf.greater(x,0.0), atan, tf.zeros_like(x))
+    angle = tf.where(tf.logical_and(tf.less(x,0.0),  tf.greater_equal(y,0.0)), atan+np.pi, angle)
+    angle = tf.where(tf.logical_and(tf.less(x,0.0),  tf.less(y,0.0)), atan-np.pi, angle)
     return angle
 
 # traditional orientation estimation
 def orientation(image, stride=8, window=17):
-    with K.tf.name_scope('orientation'):
+    with K.name_scope('orientation'):
         assert image.get_shape().as_list()[3] == 1, 'Images must be grayscale'
         strides = [1, stride, stride, 1]
         E = np.ones([window, window, 1, 1])
         sobelx = np.reshape(np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=float), [3, 3, 1, 1])
         sobely = np.reshape(np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=float), [3, 3, 1, 1])
         gaussian = np.reshape(gaussian2d((5, 5), 1), [5, 5, 1, 1])
-        with K.tf.name_scope('sobel_gradient'):
-            Ix = K.tf.nn.conv2d(image, sobelx, strides=[1,1,1,1], padding='SAME', name='sobel_x')
-            Iy = K.tf.nn.conv2d(image, sobely, strides=[1,1,1,1], padding='SAME', name='sobel_y')
-        with K.tf.name_scope('eltwise_1'):
-            Ix2 = K.tf.multiply(Ix, Ix, name='IxIx')
-            Iy2 = K.tf.multiply(Iy, Iy, name='IyIy')
-            Ixy = K.tf.multiply(Ix, Iy, name='IxIy')
-        with K.tf.name_scope('range_sum'):
-            Gxx = K.tf.nn.conv2d(Ix2, E, strides=strides, padding='SAME', name='Gxx_sum')
-            Gyy = K.tf.nn.conv2d(Iy2, E, strides=strides, padding='SAME', name='Gyy_sum')
-            Gxy = K.tf.nn.conv2d(Ixy, E, strides=strides, padding='SAME', name='Gxy_sum')
-        with K.tf.name_scope('eltwise_2'):
-            Gxx_Gyy = K.tf.subtract(Gxx, Gyy, name='Gxx_Gyy')
+        with tf.name_scope('sobel_gradient'):
+            Ix = tf.nn.conv2d(image, sobelx, strides=[1,1,1,1], padding='SAME', name='sobel_x')
+            Iy = tf.nn.conv2d(image, sobely, strides=[1,1,1,1], padding='SAME', name='sobel_y')
+        with tf.name_scope('eltwise_1'):
+            Ix2 = tf.multiply(Ix, Ix, name='IxIx')
+            Iy2 = tf.multiply(Iy, Iy, name='IyIy')
+            Ixy = tf.multiply(Ix, Iy, name='IxIy')
+        with tf.name_scope('range_sum'):
+            Gxx = tf.nn.conv2d(Ix2, E, strides=strides, padding='SAME', name='Gxx_sum')
+            Gyy = tf.nn.conv2d(Iy2, E, strides=strides, padding='SAME', name='Gyy_sum')
+            Gxy = tf.nn.conv2d(Ixy, E, strides=strides, padding='SAME', name='Gxy_sum')
+        with tf.name_scope('eltwise_2'):
+            Gxx_Gyy = tf.subtract(Gxx, Gyy, name='Gxx_Gyy')
             theta = atan2([2*Gxy, Gxx_Gyy]) + np.pi
         # two-dimensional low-pass filter: Gaussian filter here
-        with K.tf.name_scope('gaussian_filter'):
-            phi_x = K.tf.nn.conv2d(K.tf.cos(theta), gaussian, strides=[1,1,1,1], padding='SAME', name='gaussian_x')
-            phi_y = K.tf.nn.conv2d(K.tf.sin(theta), gaussian, strides=[1,1,1,1], padding='SAME', name='gaussian_y')
+        with tf.name_scope('gaussian_filter'):
+            phi_x = tf.nn.conv2d(tf.cos(theta), gaussian, strides=[1,1,1,1], padding='SAME', name='gaussian_x')
+            phi_y = tf.nn.conv2d(tf.sin(theta), gaussian, strides=[1,1,1,1], padding='SAME', name='gaussian_y')
             theta = atan2([phi_y, phi_x])/2
     return theta
 
@@ -111,7 +116,8 @@ def get_maximum_img_size_and_names(dataset, sample_rate=None):
         _, img_name_t = get_files_in_folder(folder+'images/', '.bmp')
         img_name.extend(img_name_t.tolist()*rate)
         folder_name.extend([folder]*img_name_t.shape[0]*rate)
-        img_size.append(np.array(misc.imread(folder+'images/'+img_name_t[0]+'.bmp', mode='L').shape))
+        #img_size.append(np.array(misc.imread(folder+'images/'+img_name_t[0]+'.bmp', mode='L').shape))
+        img_size.append(np.array(imread(folder+'images/'+img_name_t[0]+'.bmp', as_gray=True).shape))
     img_name = np.asarray(img_name)
     folder_name = np.asarray(folder_name)
     img_size = np.max(np.asarray(img_size), axis=0)
@@ -121,10 +127,13 @@ def get_maximum_img_size_and_names(dataset, sample_rate=None):
 
 def sub_load_data(data, img_size, aug): 
     img_name, dataset = data
-    img = misc.imread(dataset+'images/'+img_name+'.bmp', mode='L')
-    seg = misc.imread(dataset+'seg_labels/'+img_name+'.png', mode='L')
+    # img = misc.imread(dataset+'images/'+img_name+'.bmp', mode='L')
+    img = imread(dataset+'images/'+img_name+'.bmp', as_gray=True)
+    # seg = misc.imread(dataset+'seg_labels/'+img_name+'.png', mode='L')
+    seg = imread(dataset+'seg_labels/'+img_name+'.png', as_gray=True)
     try:
-        ali = misc.imread(dataset+'ori_labels/'+img_name+'.bmp', mode='L')
+        # ali = misc.imread(dataset+'ori_labels/'+img_name+'.bmp', mode='L')
+        ali = imread(dataset+'ori_labels/'+img_name+'.bmp', as_gray=True)
     except:
         ali = np.zeros_like(img)
     mnt = np.array(mnt_reader(dataset+'mnt_labels/'+img_name+'.mnt'), dtype=float)
@@ -173,7 +182,7 @@ def load_data(dataset, tra_ori_model, rand=False, aug=0.0, batch_size=1, sample_
     if batch_size > 1 and use_multiprocessing==True:
         p = Pool(batch_size)        
     p_sub_load_data = partial(sub_load_data, img_size=img_size, aug=aug)
-    for i in xrange(0,len(img_name), batch_size):
+    for i in range(0,len(img_name), batch_size):
         have_alignment = np.ones([batch_size, 1, 1, 1])
         image = np.zeros((batch_size, img_size[0], img_size[1], 1))
         segment = np.zeros((batch_size, img_size[0], img_size[1], 1))
@@ -181,13 +190,13 @@ def load_data(dataset, tra_ori_model, rand=False, aug=0.0, batch_size=1, sample_
         minutiae_w = np.zeros((batch_size, img_size[0]/8, img_size[1]/8, 1))-1
         minutiae_h = np.zeros((batch_size, img_size[0]/8, img_size[1]/8, 1))-1
         minutiae_o = np.zeros((batch_size, img_size[0]/8, img_size[1]/8, 1))-1
-        batch_name = [img_name[(i+j)%len(img_name)] for j in xrange(batch_size)]
-        batch_f_name = [folder_name[(i+j)%len(img_name)] for j in xrange(batch_size)]
+        batch_name = [img_name[(i+j)%len(img_name)] for j in range(batch_size)]
+        batch_f_name = [folder_name[(i+j)%len(img_name)] for j in range(batch_size)]
         if batch_size > 1 and use_multiprocessing==True:    
             results = p.map(p_sub_load_data, zip(batch_name, batch_f_name))
         else:
             results = map(p_sub_load_data, zip(batch_name, batch_f_name))
-        for j in xrange(batch_size):
+        for j in range(batch_size):
             img, seg, ali, mnt = results[j]
             if np.sum(ali) == 0:
                 have_alignment[j, 0, 0, 0] = 0
@@ -256,10 +265,10 @@ def merge_sum(x):
 def reduce_sum(x):
     return K.sum(x,axis=-1,keepdims=True) 
 def merge_concat(x):
-    return K.tf.concat(x,3)
+    return tf.concat(x,3)
 def select_max(x):
     x = x / (K.max(x, axis=-1, keepdims=True)+K.epsilon())
-    x = K.tf.where(K.tf.greater(x, 0.999), x, K.tf.zeros_like(x)) # select the biggest one
+    x = tf.where(K.greater(x, 0.999), x, K.zeros_like(x)) # select the biggest one
     x = x / (K.sum(x, axis=-1, keepdims=True)+K.epsilon()) # prevent two or more ori is selected
     return x  
 def conv_bn(bottom, w_size, name, strides=(1,1), dilation_rate=(1,1)):
@@ -563,7 +572,7 @@ def label2mnt(mnt_s_out, mnt_w_out, mnt_h_out, mnt_o_out, thresh=0.5):
     assert len(mnt_s_out.shape)==2 and len(mnt_w_out.shape)==3 and len(mnt_h_out.shape)==3 and len(mnt_o_out.shape)==3 
     # get cls results
     mnt_sparse = sparse.coo_matrix(mnt_s_out>thresh)
-    mnt_list = np.array(zip(mnt_sparse.row, mnt_sparse.col), dtype=np.int32)
+    mnt_list = np.array(list(zip(mnt_sparse.row, mnt_sparse.col)), dtype=np.int32)
     if mnt_list.shape[0] == 0:
         return np.zeros((0, 4))
     # get regression results
@@ -638,16 +647,19 @@ def deploy(deploy_set, set_name=None):
     if len(img_name) == 0:
         deploy_set = deploy_set+'images/'
         _, img_name = get_files_in_folder(deploy_set, '.bmp')
-    img_size = misc.imread(deploy_set+img_name[0]+'.bmp', mode='L').shape
+    # img_size = misc.imread(deploy_set+img_name[0]+'.bmp', mode='L').shape
+    img_size = imread(deploy_set+img_name[0]+'.bmp', as_gray=True).shape
     img_size = np.array(img_size, dtype=np.int32)/8*8      
     main_net_model = get_main_net((img_size[0],img_size[1],1), pretrain)
     _, img_name = get_files_in_folder(deploy_set, '.bmp')
     time_c = []
-    for i in xrange(0,len(img_name)):
+    #print("IMGSIZE!!!!!", img_size)
+    for i in range(0,len(img_name)):
         logging.info("%s %d / %d: %s"%(set_name, i+1, len(img_name), img_name[i]))
         time_start = time()    
-        image = misc.imread(deploy_set+img_name[i]+'.bmp', mode='L') / 255.0
-        image = image[:img_size[0],:img_size[1]]      
+        # image = misc.imread(deploy_set+img_name[i]+'.bmp', mode='L') / 255.0
+        image = imread(deploy_set+img_name[i]+'.bmp', as_gray=True) / 255.0
+        image = image[:int(img_size[0]), :int(img_size[1])]      
         image = np.reshape(image,[1, image.shape[0], image.shape[1], 1])
         enhance_img, ori_out_1, ori_out_2, seg_out, mnt_o_out, mnt_w_out, mnt_h_out, mnt_s_out = main_net_model.predict(image) 
         time_afterconv = time()
@@ -662,8 +674,10 @@ def deploy(deploy_set, set_name=None):
         mnt_writer(mnt_nms, img_name[i], img_size, "%s/%s/%s.mnt"%(output_dir, set_name, img_name[i]))        
         draw_ori_on_img(image, ori, np.ones_like(seg_out), "%s/%s/%s_ori.png"%(output_dir, set_name, img_name[i]))        
         draw_minutiae(image, mnt_nms[:,:3], "%s/%s/%s_mnt.png"%(output_dir, set_name, img_name[i]))
-        misc.imsave("%s/%s/%s_enh.png"%(output_dir, set_name, img_name[i]), np.squeeze(enhance_img)*ndimage.zoom(np.round(np.squeeze(seg_out)), [8,8], order=0))
-        misc.imsave("%s/%s/%s_seg.png"%(output_dir, set_name, img_name[i]), ndimage.zoom(np.round(np.squeeze(seg_out)), [8,8], order=0)) 
+        # misc.imsave("%s/%s/%s_enh.png"%(output_dir, set_name, img_name[i]), np.squeeze(enhance_img)*ndimage.zoom(np.round(np.squeeze(seg_out)), [8,8], order=0))
+        imsave("%s/%s/%s_enh.png"%(output_dir, set_name, img_name[i]), np.squeeze(enhance_img)*ndimage.zoom(np.round(np.squeeze(seg_out)), [8,8], order=0))
+        # misc.imsave("%s/%s/%s_seg.png"%(output_dir, set_name, img_name[i]), ndimage.zoom(np.round(np.squeeze(seg_out)), [8,8], order=0)) 
+        imsave("%s/%s/%s_seg.png"%(output_dir, set_name, img_name[i]), ndimage.zoom(np.round(np.squeeze(seg_out)), [8,8], order=0)) 
         io.savemat("%s/%s/%s.mat"%(output_dir, set_name, img_name[i]), {'orientation':ori, 'orientation_distribution_map':ori_out_1})
         time_afterdraw = time()
         time_c.append([time_afterconv-time_start, time_afterpost-time_afterconv, time_afterdraw-time_afterpost])
