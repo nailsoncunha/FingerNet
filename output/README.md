@@ -1,0 +1,1 @@
+## Minúcias extraídas são salvas aqui
